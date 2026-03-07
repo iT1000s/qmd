@@ -563,6 +563,7 @@ describe("MCP Server", () => {
     test("returns index status", () => {
       const status = getStatus(testDb);
       expect(status.totalDocuments).toBe(5);
+      expect(typeof status.embedModel).toBe("string");
       expect(status.hasVectorIndex).toBe(true);
       expect(status.collections.length).toBe(1);
       expect(status.collections[0]!.path).toBe("/test/docs");
@@ -853,6 +854,7 @@ describe("MCP Server", () => {
       // Verify structure matches StatusResult type
       expect(typeof status.totalDocuments).toBe("number");
       expect(typeof status.needsEmbedding).toBe("number");
+      expect(typeof status.embedModel).toBe("string");
       expect(typeof status.hasVectorIndex).toBe("boolean");
       expect(Array.isArray(status.collections)).toBe(true);
       if (status.collections.length > 0) {

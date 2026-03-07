@@ -174,7 +174,9 @@ export type RerankDocument = {
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const FALLBACK_EMBED_MODEL_URI = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const FALLBACK_EMBED_MODEL_ID = "embeddinggemma";
+const DEFAULT_EMBED_MODEL = (process.env.QMD_EMBED_LOCAL_MODEL || FALLBACK_EMBED_MODEL_URI).trim() || FALLBACK_EMBED_MODEL_URI;
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -186,12 +188,37 @@ export const LFM2_GENERATE_MODEL = "hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.
 export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf";
 
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
+export const DEFAULT_EMBED_MODEL_ID = (process.env.QMD_EMBED_MODEL_ID || FALLBACK_EMBED_MODEL_ID).trim() || FALLBACK_EMBED_MODEL_ID;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
 export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 
 // Local model cache directory
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
+
+const DEFAULT_REMOTE_EMBED_TIMEOUT_MS = 10000;
+
+export type RemoteEmbeddingConfig = {
+  url: string;
+  model: string;
+  apiKey?: string;
+  timeoutMs?: number;
+  allowInsecureHttp?: boolean;
+};
+
+type ResolvedRemoteEmbeddingConfig = {
+  url: string;
+  model: string;
+  apiKey?: string;
+  timeoutMs: number;
+};
+
+export type EmbeddingBackendConfig = {
+  modelId: string;
+  localModelUri: string;
+  remote: ResolvedRemoteEmbeddingConfig | null;
+  allowModelMismatch: boolean;
+};
 
 export type PullResult = {
   model: string;
@@ -205,6 +232,88 @@ type HfRef = {
   file: string;
 };
 
+function normalizeBooleanEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const v = value.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function normalizeUrl(url: string, allowInsecureHttpOverride: boolean = false): string {
+  const normalized = url.trim();
+  if (!normalized) {
+    throw new Error("QMD embedding remote URL is empty");
+  }
+  const parsed = new URL(normalized);
+  const protocol = parsed.protocol.toLowerCase();
+  if (protocol !== "https:" && protocol !== "http:") {
+    throw new Error(`QMD embedding remote URL must use http(s): ${normalized}`);
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  const allowInsecureHttp = allowInsecureHttpOverride || normalizeBooleanEnv(process.env.QMD_EMBED_REMOTE_ALLOW_INSECURE_HTTP);
+  if (protocol === "http:" && !isLocalhost && !allowInsecureHttp) {
+    throw new Error(
+      "QMD embedding remote URL uses plain HTTP for a non-localhost endpoint. " +
+      "Use HTTPS or set QMD_EMBED_REMOTE_ALLOW_INSECURE_HTTP=1 to force."
+    );
+  }
+  return normalized.replace(/\/+$/, "");
+}
+
+function resolveRemoteEmbeddingFromEnv(): RemoteEmbeddingConfig | null {
+  const url = process.env.QMD_EMBED_REMOTE_URL?.trim();
+  if (!url) return null;
+  const model = (process.env.QMD_EMBED_REMOTE_MODEL || DEFAULT_EMBED_MODEL_ID).trim() || DEFAULT_EMBED_MODEL_ID;
+  const timeoutRaw = process.env.QMD_EMBED_REMOTE_TIMEOUT_MS?.trim();
+  const timeoutMs = timeoutRaw ? parseInt(timeoutRaw, 10) : DEFAULT_REMOTE_EMBED_TIMEOUT_MS;
+  return {
+    url,
+    model,
+    apiKey: process.env.QMD_EMBED_REMOTE_API_KEY?.trim() || undefined,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_REMOTE_EMBED_TIMEOUT_MS,
+    allowInsecureHttp: normalizeBooleanEnv(process.env.QMD_EMBED_REMOTE_ALLOW_INSECURE_HTTP),
+  };
+}
+
+function resolveRemoteEmbeddingConfig(config?: RemoteEmbeddingConfig | null): ResolvedRemoteEmbeddingConfig | null {
+  if (!config) return null;
+  const url = normalizeUrl(config.url, !!config.allowInsecureHttp);
+  const model = config.model.trim();
+  if (!model) {
+    throw new Error("QMD embedding remote model ID is empty");
+  }
+  const timeoutMs = config.timeoutMs && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
+    ? config.timeoutMs
+    : DEFAULT_REMOTE_EMBED_TIMEOUT_MS;
+  return {
+    url,
+    model,
+    apiKey: config.apiKey?.trim() || undefined,
+    timeoutMs,
+  };
+}
+
+function getEmbeddingBackendConfigFromEnvUnchecked(): EmbeddingBackendConfig {
+  const modelId = (process.env.QMD_EMBED_MODEL_ID || DEFAULT_EMBED_MODEL_ID).trim() || DEFAULT_EMBED_MODEL_ID;
+  const localModelUri = (process.env.QMD_EMBED_LOCAL_MODEL || DEFAULT_EMBED_MODEL_URI).trim() || DEFAULT_EMBED_MODEL_URI;
+  const remote = resolveRemoteEmbeddingConfig(resolveRemoteEmbeddingFromEnv());
+  const allowModelMismatch = normalizeBooleanEnv(process.env.QMD_EMBED_ALLOW_MODEL_MISMATCH);
+  return { modelId, localModelUri, remote, allowModelMismatch };
+}
+
+export function getEmbeddingBackendConfigFromEnv(): EmbeddingBackendConfig {
+  const config = getEmbeddingBackendConfigFromEnvUnchecked();
+  const { modelId, remote, allowModelMismatch } = config;
+  if (remote && remote.model !== modelId && !allowModelMismatch) {
+    throw new Error(
+      "QMD embedding config error: remote and local model IDs differ. " +
+      `remote="${remote.model}", local="${modelId}". ` +
+      "Set QMD_EMBED_ALLOW_MODEL_MISMATCH=1 (or --force-model-mismatch) to override."
+    );
+  }
+  return config;
+}
+
 function parseHfUri(model: string): HfRef | null {
   if (!model.startsWith("hf:")) return null;
   const without = model.slice(3);
@@ -213,6 +322,79 @@ function parseHfUri(model: string): HfRef | null {
   const repo = parts.slice(0, 2).join("/");
   const file = parts.slice(2).join("/");
   return { repo, file };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseEmbeddingResponse(json: unknown): number[] | null {
+  if (!isObject(json)) return null;
+  const data = json["data"];
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const first = data[0];
+  if (!isObject(first)) return null;
+  const embedding = first["embedding"];
+  if (!Array.isArray(embedding)) return null;
+  const vector: number[] = [];
+  for (const value of embedding) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return null;
+    vector.push(value);
+  }
+  return vector.length > 0 ? vector : null;
+}
+
+function parseEmbeddingBatchResponse(json: unknown): (number[] | null)[] | null {
+  if (!isObject(json)) return null;
+  const data = json["data"];
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const parsed: { index: number; embedding: number[] }[] = [];
+  for (let i = 0; i < data.length; i++) {
+    const item = data[i];
+    if (!isObject(item)) continue;
+    const embedding = item["embedding"];
+    if (!Array.isArray(embedding)) continue;
+    const vector: number[] = [];
+    let valid = true;
+    for (const value of embedding) {
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        valid = false;
+        break;
+      }
+      vector.push(value);
+    }
+    if (!valid || vector.length === 0) continue;
+    const rawIndex = item["index"];
+    const index = typeof rawIndex === "number" && Number.isInteger(rawIndex) && rawIndex >= 0 ? rawIndex : i;
+    parsed.push({ index, embedding: vector });
+  }
+
+  if (parsed.length === 0) return null;
+  const maxIndex = Math.max(...parsed.map(p => p.index));
+  const out: (number[] | null)[] = Array.from({ length: maxIndex + 1 }, () => null);
+  for (const item of parsed) {
+    out[item.index] = item.embedding;
+  }
+  return out;
+}
+
+function buildEmbeddingsPath(baseUrl: string): string {
+  if (baseUrl.endsWith("/embeddings")) return baseUrl;
+  return `${baseUrl}/embeddings`;
+}
+
+async function formatRemoteHttpError(response: Response): Promise<string> {
+  let body = "";
+  try {
+    body = (await response.text()).trim();
+  } catch {
+    body = "";
+  }
+  const statusLine = `remote embedding HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  if (!body) return statusLine;
+  const shortBody = body.length > 400 ? `${body.slice(0, 400)}...` : body;
+  return `${statusLine}: ${shortBody}`;
 }
 
 async function getRemoteEtag(ref: HfRef): Promise<string | null> {
@@ -331,7 +513,10 @@ export interface LLM {
 // =============================================================================
 
 export type LlamaCppConfig = {
+  embedModelId?: string;
   embedModel?: string;
+  remoteEmbed?: RemoteEmbeddingConfig | null;
+  allowEmbedModelMismatch?: boolean;
   generateModel?: string;
   rerankModel?: string;
   modelCacheDir?: string;
@@ -366,7 +551,9 @@ export class LlamaCpp implements LLM {
   private rerankModel: LlamaModel | null = null;
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
 
+  private embedModelId: string;
   private embedModelUri: string;
+  private remoteEmbed: ResolvedRemoteEmbeddingConfig | null;
   private generateModelUri: string;
   private rerankModelUri: string;
   private modelCacheDir: string;
@@ -386,7 +573,18 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
+    const envEmbedConfig = getEmbeddingBackendConfigFromEnvUnchecked();
+    this.embedModelId = config.embedModelId || envEmbedConfig.modelId;
+    this.embedModelUri = config.embedModel || envEmbedConfig.localModelUri;
+    this.remoteEmbed = resolveRemoteEmbeddingConfig(config.remoteEmbed === undefined ? envEmbedConfig.remote : config.remoteEmbed);
+    const allowModelMismatch = config.allowEmbedModelMismatch ?? envEmbedConfig.allowModelMismatch;
+    if (this.remoteEmbed && this.remoteEmbed.model !== this.embedModelId && !allowModelMismatch) {
+      throw new Error(
+        "QMD embedding config error: remote and local model IDs differ. " +
+        `remote="${this.remoteEmbed.model}", local="${this.embedModelId}". ` +
+        "Set QMD_EMBED_ALLOW_MODEL_MISMATCH=1 (or --force-model-mismatch) to override."
+      );
+    }
     this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
     this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
@@ -796,6 +994,107 @@ export class LlamaCpp implements LLM {
     return this.embedModel.detokenize(tokens);
   }
 
+  getEmbedModelId(): string {
+    return this.embedModelId;
+  }
+
+  getEmbedModelUri(): string {
+    return this.embedModelUri;
+  }
+
+  getRemoteEmbedModelId(): string | null {
+    return this.remoteEmbed?.model ?? null;
+  }
+
+  private async embedRemote(text: string): Promise<EmbeddingResult | null> {
+    if (!this.remoteEmbed) return null;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.remoteEmbed.timeoutMs);
+    timer.unref();
+
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (this.remoteEmbed.apiKey) {
+        headers.Authorization = `Bearer ${this.remoteEmbed.apiKey}`;
+      }
+
+      const response = await fetch(buildEmbeddingsPath(this.remoteEmbed.url), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: this.remoteEmbed.model,
+          input: text,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(await formatRemoteHttpError(response));
+      }
+      const parsed = parseEmbeddingResponse(await response.json());
+      if (!parsed) {
+        throw new Error("remote embedding response missing vector");
+      }
+      return {
+        embedding: parsed,
+        model: this.embedModelId,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async embedBatchRemote(texts: string[]): Promise<(EmbeddingResult | null)[] | null> {
+    if (!this.remoteEmbed) return null;
+    if (texts.length === 0) return [];
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.remoteEmbed.timeoutMs);
+    timer.unref();
+
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (this.remoteEmbed.apiKey) {
+        headers.Authorization = `Bearer ${this.remoteEmbed.apiKey}`;
+      }
+
+      const response = await fetch(buildEmbeddingsPath(this.remoteEmbed.url), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: this.remoteEmbed.model,
+          input: texts,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(await formatRemoteHttpError(response));
+      }
+
+      const parsed = parseEmbeddingBatchResponse(await response.json());
+      if (!parsed) {
+        throw new Error("remote embedding response missing vectors");
+      }
+
+      const out: (EmbeddingResult | null)[] = texts.map(() => null);
+      for (let i = 0; i < texts.length; i++) {
+        const vector = parsed[i];
+        if (!vector) continue;
+        out[i] = {
+          embedding: vector,
+          model: this.embedModelId,
+        };
+      }
+      return out;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // ==========================================================================
   // Core API methods
   // ==========================================================================
@@ -804,13 +1103,30 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    const requestedModel = options.model?.trim();
+    if (requestedModel && requestedModel !== this.embedModelId && requestedModel !== this.embedModelUri) {
+      console.error(
+        `Embedding model mismatch: requested "${requestedModel}", configured "${this.embedModelId}" (${this.embedModelUri})`
+      );
+      return null;
+    }
+
+    if (this.remoteEmbed) {
+      try {
+        const remote = await this.embedRemote(text);
+        if (remote) return remote;
+      } catch (error) {
+        console.error("Remote embedding failed, falling back to local model:", error);
+      }
+    }
+
     try {
       const context = await this.ensureEmbedContext();
       const embedding = await context.getEmbeddingFor(text);
 
       return {
         embedding: Array.from(embedding.vector),
-        model: this.embedModelUri,
+        model: this.embedModelId,
       };
     } catch (error) {
       console.error("Embedding error:", error);
@@ -828,6 +1144,15 @@ export class LlamaCpp implements LLM {
 
     if (texts.length === 0) return [];
 
+    if (this.remoteEmbed) {
+      try {
+        const remote = await this.embedBatchRemote(texts);
+        if (remote) return remote;
+      } catch (error) {
+        console.error("Remote batch embedding failed, falling back to local model:", error);
+      }
+    }
+
     try {
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
@@ -840,7 +1165,7 @@ export class LlamaCpp implements LLM {
           try {
             const embedding = await context.getEmbeddingFor(text);
             this.touchActivity();
-            embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+            embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelId });
           } catch (err) {
             console.error("Embedding error for text:", err);
             embeddings.push(null);
@@ -863,7 +1188,7 @@ export class LlamaCpp implements LLM {
             try {
               const embedding = await ctx.getEmbeddingFor(text);
               this.touchActivity();
-              results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
+              results.push({ embedding: Array.from(embedding.vector), model: this.embedModelId });
             } catch (err) {
               console.error("Embedding error for text:", err);
               results.push(null);
@@ -1396,7 +1721,12 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = new LlamaCpp({
+      embedModelId: DEFAULT_EMBED_MODEL_ID,
+      embedModel: DEFAULT_EMBED_MODEL_URI,
+      remoteEmbed: resolveRemoteEmbeddingFromEnv(),
+      allowEmbedModelMismatch: normalizeBooleanEnv(process.env.QMD_EMBED_ALLOW_MODEL_MISMATCH),
+    });
   }
   return defaultLlamaCpp;
 }

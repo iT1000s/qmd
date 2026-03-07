@@ -1959,6 +1959,7 @@ describe("Index Status", () => {
     const status = store.getStatus();
     expect(status).toHaveProperty("totalDocuments");
     expect(status).toHaveProperty("needsEmbedding");
+    expect(status).toHaveProperty("embedModel");
     expect(status).toHaveProperty("hasVectorIndex");
     expect(status).toHaveProperty("collections");
     expect(Array.isArray(status.collections)).toBe(true);
@@ -2007,6 +2008,24 @@ describe("Index Status", () => {
 
     const needsEmbedding = store.getHashesNeedingEmbedding();
     expect(needsEmbedding).toBe(2); // hash1 and hash2
+
+    await cleanupTestDb(store);
+  });
+
+  test("getHashesNeedingEmbedding is model-specific", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hashA" });
+    await insertTestDocument(store.db, collectionName, { name: "doc2", hash: "hashB" });
+
+    store.ensureVecTable(4);
+    const now = new Date().toISOString();
+    const vec = new Float32Array([0.1, 0.2, 0.3, 0.4]);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'other-model', ?)`).run("hashA", now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run("hashA_0", vec);
+
+    expect(store.getHashesNeedingEmbedding()).toBe(2);
 
     await cleanupTestDb(store);
   });
@@ -2278,7 +2297,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?)`).run(hash, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
@@ -2314,8 +2333,8 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     store.ensureVecTable(768);
     const embedding1 = Array(768).fill(0).map(() => Math.random());
     const embedding2 = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?)`).run(hash1, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?)`).run(hash2, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
@@ -2350,7 +2369,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a test vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'embeddinggemma', ?)`).run(hash, new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix

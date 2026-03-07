@@ -15,6 +15,8 @@ import {
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
+  DEFAULT_EMBED_MODEL_ID,
+  DEFAULT_EMBED_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
@@ -30,6 +32,32 @@ describe("Default LlamaCpp Singleton", () => {
     const llm2 = getDefaultLlamaCpp();
     expect(llm1).toBe(llm2);
     expect(llm1).toBeInstanceOf(LlamaCpp);
+  });
+});
+describe("Embedding model config validation", () => {
+  test("throws when remote/local model IDs mismatch without override", () => {
+    expect(() => new LlamaCpp({
+      embedModelId: "local-model",
+      embedModel: DEFAULT_EMBED_MODEL_URI,
+      remoteEmbed: { url: "http://localhost:11434/v1", model: "remote-model" },
+    })).toThrow(/model IDs differ/i);
+  });
+
+  test("allows mismatch when override is enabled", () => {
+    expect(() => new LlamaCpp({
+      embedModelId: "local-model",
+      embedModel: DEFAULT_EMBED_MODEL_URI,
+      remoteEmbed: { url: "http://localhost:11434/v1", model: "remote-model" },
+      allowEmbedModelMismatch: true,
+    })).not.toThrow();
+  });
+
+  test("uses default embed model id when not overridden", () => {
+    const llm = new LlamaCpp({
+      embedModel: DEFAULT_EMBED_MODEL_URI,
+      remoteEmbed: null,
+    });
+    expect(llm.getEmbedModelId()).toBe(DEFAULT_EMBED_MODEL_ID);
   });
 });
 
@@ -600,4 +628,3 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
     });
   });
 });
-

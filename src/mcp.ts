@@ -42,6 +42,7 @@ type SearchResultItem = {
 type StatusResult = {
   totalDocuments: number;
   needsEmbedding: number;
+  embedModel: string;
   hasVectorIndex: boolean;
   collections: {
     name: string;
@@ -506,7 +507,7 @@ Intent-aware lex (C++ performance, not sports):
       const summary = [
         `QMD Index Status:`,
         `  Total documents: ${status.totalDocuments}`,
-        `  Needs embedding: ${status.needsEmbedding}`,
+        `  Needs embedding: ${status.needsEmbedding} (${status.embedModel})`,
         `  Vector index: ${status.hasVectorIndex ? 'yes' : 'no'}`,
         `  Collections: ${status.collections.length}`,
       ];

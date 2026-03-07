@@ -70,7 +70,17 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  withLLMSession,
+  pullModels,
+  getEmbeddingBackendConfigFromEnv,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_MODEL_CACHE_DIR,
+} from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -188,10 +198,14 @@ function formatETA(seconds: number): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
+function currentEmbedModelId(): string {
+  return getDefaultLlamaCpp().getEmbedModelId();
+}
+
 
 // Check index health and print warnings/tips
 function checkIndexHealth(db: Database): void {
-  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db);
+  const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, currentEmbedModelId());
 
   // Warn if many docs need embedding
   if (needsEmbedding > 0) {
@@ -288,8 +302,9 @@ async function showStatus(): Promise<void> {
 
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
-  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const embedModelId = currentEmbedModelId();
+  const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors WHERE model = ?`).get(embedModelId) as { count: number };
+  const needsEmbedding = getHashesNeedingEmbedding(db, embedModelId);
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -317,7 +332,7 @@ async function showStatus(): Promise<void> {
 
   console.log(`${c.bold}Documents${c.reset}`);
   console.log(`  Total:    ${totalDocs.count} files indexed`);
-  console.log(`  Vectors:  ${vectorCount.count} embedded`);
+  console.log(`  Vectors:  ${vectorCount.count} embedded (${embedModelId})`);
   if (needsEmbedding > 0) {
     console.log(`  ${c.yellow}Pending:  ${needsEmbedding} need embedding${c.reset} (run 'qmd embed')`);
   }
@@ -389,8 +404,12 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const llm = getDefaultLlamaCpp();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    console.log(`  Embedding:   ${hfLink(llm.getEmbedModelUri())} ${c.dim}[id: ${llm.getEmbedModelId()}]${c.reset}`);
+    if (llm.getRemoteEmbedModelId()) {
+      console.log(`  Embedding remote: ${llm.getRemoteEmbedModelId()}`);
+    }
     console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
     console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
   }
@@ -528,7 +547,7 @@ async function updateCollections(): Promise<void> {
 
   // Check if any documents need embedding (show once at end)
   const finalDb = getDb();
-  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
+  const needsEmbedding = getHashesNeedingEmbedding(finalDb, currentEmbedModelId());
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
@@ -1508,7 +1527,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const orphanedContent = cleanupOrphanedContent(db);
 
   // Check if vector index needs updating
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, currentEmbedModelId());
 
   progress.clear();
   console.log(`\nIndexed: ${indexed} new, ${updated} updated, ${unchanged} unchanged, ${removed} removed`);
@@ -1541,7 +1560,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Find unique hashes that need embedding (from active documents)
-  const hashesToEmbed = getHashesForEmbedding(db);
+  const hashesToEmbed = getHashesForEmbedding(db, model);
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -2054,7 +2073,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(query: string, opts: OutputOptions, model: string = DEFAULT_EMBED_MODEL): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2067,6 +2086,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
+      model,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       hooks: {
@@ -2247,6 +2267,7 @@ function parseCLI() {
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
       skill: { type: "boolean" },
+      "force-model-mismatch": { type: "boolean" },
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
@@ -2403,6 +2424,7 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
+  console.log("  --force-model-mismatch     - Allow remote/local embedding model ID mismatch");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --files/--json)");
@@ -2446,6 +2468,9 @@ const isMain = argv1 === __filename
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
   const cli = parseCLI();
+  if (cli.values["force-model-mismatch"]) {
+    process.env.QMD_EMBED_ALLOW_MODEL_MISMATCH = "1";
+  }
 
   if (cli.values.version) {
     await showVersion();
@@ -2460,6 +2485,14 @@ if (isMain) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Validate embedding config before running commands.
+  try {
+    getEmbeddingBackendConfigFromEnv();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   }
 
   switch (cli.command) {
@@ -2718,7 +2751,7 @@ if (isMain) {
       break;
 
     case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+      await vectorIndex(currentEmbedModelId(), !!cli.values.force);
       break;
 
     case "pull": {
@@ -2759,7 +2792,7 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
-      await vectorSearch(cli.query, cli.opts);
+      await vectorSearch(cli.query, cli.opts, currentEmbedModelId());
       break;
 
     case "query":

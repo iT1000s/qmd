@@ -17,8 +17,8 @@ import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
-  LlamaCpp,
   getDefaultLlamaCpp,
+  DEFAULT_EMBED_MODEL_ID,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -44,7 +44,7 @@ import {
 // =============================================================================
 
 const HOME = process.env.HOME || "/tmp";
-export const DEFAULT_EMBED_MODEL = "embeddinggemma";
+export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_ID;
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
@@ -60,6 +60,10 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 // Search window for finding optimal break points (in tokens, ~200 tokens)
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+
+function getConfiguredEmbedModel(): string {
+  return getDefaultLlamaCpp().getEmbedModelId();
+}
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -1059,6 +1063,7 @@ export type CollectionInfo = {
 export type IndexStatus = {
   totalDocuments: number;
   needsEmbedding: number;
+  embedModel: string;
   hasVectorIndex: boolean;
   collections: CollectionInfo[];
 };
@@ -1067,13 +1072,14 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+export function getHashesNeedingEmbedding(db: Database, model?: string): number {
+  const embedModel = model || getConfiguredEmbedModel();
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0 AND v.model = ?
     WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+  `).get(embedModel) as { count: number };
   return result.count;
 }
 
@@ -1083,8 +1089,8 @@ export type IndexHealthInfo = {
   daysStale: number | null;
 };
 
-export function getIndexHealth(db: Database): IndexHealthInfo {
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+export function getIndexHealth(db: Database, model?: string): IndexHealthInfo {
+  const needsEmbedding = getHashesNeedingEmbedding(db, model);
   const totalDocs = (db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number }).count;
 
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -2189,9 +2195,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    WHERE cv.model = ? AND cv.hash || '_' || cv.seq IN (${placeholders})
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [model, ...hashSeqs];
 
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
@@ -2253,15 +2259,16 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(db: Database, model?: string): { hash: string; body: string; path: string }[] {
+  const embedModel = model || getConfiguredEmbedModel();
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0 AND v.model = ?
     WHERE d.active = 1 AND v.hash IS NULL
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  `).all(embedModel) as { hash: string; body: string; path: string }[];
 }
 
 /**
@@ -2311,7 +2318,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  // Note: expandQuery currently uses the configured default generation model.
   const results = await llm.expandQuery(query);
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2742,13 +2749,15 @@ export function getStatus(db: Database): IndexStatus {
     return new Date(b.lastUpdated).getTime() - new Date(a.lastUpdated).getTime();
   });
 
+  const embedModel = getConfiguredEmbedModel();
   const totalDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c;
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const needsEmbedding = getHashesNeedingEmbedding(db, embedModel);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   return {
     totalDocuments: totalDocs,
     needsEmbedding,
+    embedModel,
     hasVectorIndex: hasVectors,
     collections,
   };
@@ -2985,6 +2994,7 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getDefaultLlamaCpp();
+    const embedModelId = llm.getEmbedModelId();
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -2997,7 +3007,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecQueries[i]!.text, embedModelId, 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -3097,6 +3107,7 @@ export interface VectorSearchOptions {
   collection?: string;
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
+  model?: string;
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -3127,6 +3138,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const model = options?.model ?? getConfiguredEmbedModel();
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
@@ -3143,7 +3155,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, model, limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -3274,6 +3286,7 @@ export async function structuredSearch(
     const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
     if (vecSearches.length > 0) {
       const llm = getDefaultLlamaCpp();
+      const embedModelId = llm.getEmbedModelId();
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
@@ -3286,7 +3299,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            vecSearches[i]!.query, embedModelId, 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {
