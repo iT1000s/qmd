@@ -88,7 +88,7 @@ log() {
 }
 
 run_qmd() {
-  "${TSX}" src/qmd.ts "$@"
+  "${TSX}" src/cli/qmd.ts "$@"
 }
 
 start_mock_server() {

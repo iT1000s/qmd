@@ -89,7 +89,7 @@ log() {
 }
 
 run_qmd() {
-  "${TSX}" src/qmd.ts "$@"
+  "${TSX}" src/cli/qmd.ts "$@"
 }
 
 read_hit_count() {

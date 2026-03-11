@@ -374,7 +374,7 @@ paths, case-sensitive model filenames, and sqlite-vec JOIN incompatibilities.
   @gavrix)
 - Fix sqlite-vec loading on macOS with Homebrew (`BREW_PREFIX` detection).
   #42 (thanks @komsit37)
-- Fix Nix flake to use correct `src/qmd.ts` path. #7 (thanks @burke)
+- Fix Nix flake to use correct `src/cli/qmd.ts` path. #7 (thanks @burke)
 - Fix docid lookup with quotes support in get command. #36 (thanks
   @JoshuaLelon)
 - Fix query expansion model size in documentation. #38 (thanks @odysseus0)
